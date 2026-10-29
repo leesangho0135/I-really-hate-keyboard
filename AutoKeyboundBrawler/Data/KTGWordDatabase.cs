@@ -1,10 +1,12 @@
-using Dalamud.Game;
 using Dalamud.Plugin.Services;
-using ECommons.DalamudServices;
+using Lumina.Data;
+using Lumina.Excel;
+using Lumina.Excel.Exceptions;
 using Lumina.Excel.Sheets;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 
 namespace AutoKeyboundBrawler.Data;
 
@@ -28,30 +30,46 @@ public static class KTGWordDatabase
 
     public static bool IsLoaded { get; private set; }
     public static int Count => Entries.Count;
-    public static ClientLanguage CurrentLanguage { get; private set; } = ClientLanguage.English;
+    public static Language CurrentLanguage { get; private set; } = Language.English;
+    private static Language? _requestedLanguage;
 
-    public static bool Load(IDataManager dataManager, IPluginLog? log = null, ClientLanguage? forcedLanguage = null)
+    public static bool NeedsReload(IDataManager dataManager)
     {
-        var targetLang = forcedLanguage ?? Svc.ClientState.ClientLanguage;
-        if (IsLoaded && Entries.Count > 0 && CurrentLanguage == targetLang)
+        return !IsLoaded || _requestedLanguage != dataManager.GameData.Options.DefaultExcelLanguage;
+    }
+
+    public static bool Load(IDataManager dataManager, IPluginLog? log = null, Language? forcedLanguage = null)
+    {
+        var targetLang = forcedLanguage ?? dataManager.GameData.Options.DefaultExcelLanguage;
+        if (IsLoaded && Entries.Count > 0 && _requestedLanguage == targetLang)
         {
             return true;
         }
 
         try
         {
-            // 1. Get sheet for client's active language
-            var sheet = dataManager.GetExcelSheet<KTGTypeWordTextData>(targetLang) ??
-                        dataManager.GetExcelSheet<KTGTypeWordTextData>();
-
-            if (sheet == null)
+            // Dalamud's ClientLanguage has no Korean value. Korean clients can
+            // still expose a Korean sheet through Lumina, independently of it.
+            ExcelSheet<KTGTypeWordTextData> sheet;
+            try
             {
-                log?.Error($"[KTGWordDatabase] Failed to open Excel sheet KTGTypeWordTextData for language {targetLang}.");
-                return false;
+                sheet = dataManager.Excel.GetSheet<KTGTypeWordTextData>(forcedLanguage ?? Language.Korean);
+            }
+            catch (UnsupportedLanguageException) when (!forcedLanguage.HasValue)
+            {
+                sheet = dataManager.Excel.GetSheet<KTGTypeWordTextData>(targetLang);
             }
 
-            // 2. Also open English sheet to reliably establish defense and cactuar flags across all languages
-            var englishSheet = dataManager.GetExcelSheet<KTGTypeWordTextData>(ClientLanguage.English);
+            // Regional clients need not include an English copy of this sheet.
+            ExcelSheet<KTGTypeWordTextData>? englishSheet = null;
+            try
+            {
+                englishSheet = dataManager.Excel.GetSheet<KTGTypeWordTextData>(Language.English);
+            }
+            catch (UnsupportedLanguageException)
+            {
+                log?.Information("[KTGWordDatabase] English word sheet unavailable; using localized classification.");
+            }
 
             Entries.Clear();
             ByExactMatch.Clear();
@@ -74,7 +92,7 @@ public static class KTGWordDatabase
                     text = reading;
                 }
 
-                var normalized = text.ToLowerInvariant();
+                var normalized = NormalizeWord(text);
                 var stripped = StripPunctuation(normalized);
 
                 // Compute defense flag based on English sheet metadata
@@ -135,12 +153,14 @@ public static class KTGWordDatabase
 
                 if (!string.IsNullOrWhiteSpace(reading))
                 {
-                    ByExactMatch.TryAdd(reading.ToLowerInvariant(), entry);
-                    ByStrippedMatch.TryAdd(StripPunctuation(reading.ToLowerInvariant()), entry);
+                    var normalizedReading = NormalizeWord(reading);
+                    ByExactMatch.TryAdd(normalizedReading, entry);
+                    ByStrippedMatch.TryAdd(StripPunctuation(normalizedReading), entry);
                 }
             }
 
-            CurrentLanguage = targetLang;
+            CurrentLanguage = sheet.Language;
+            _requestedLanguage = targetLang;
             IsLoaded = true;
             log?.Information($"[KTGWordDatabase] Successfully loaded {Entries.Count} words for language {CurrentLanguage}.");
             return true;
@@ -193,7 +213,7 @@ public static class KTGWordDatabase
             return null;
         }
 
-        var normalized = promptText.Trim().ToLowerInvariant();
+        var normalized = NormalizeWord(promptText);
         if (ByExactMatch.TryGetValue(normalized, out var exact))
         {
             return exact;
@@ -214,5 +234,10 @@ public static class KTGWordDatabase
         }
 
         return null;
+    }
+
+    private static string NormalizeWord(string text)
+    {
+        return text.Normalize(NormalizationForm.FormC).Trim().ToLowerInvariant();
     }
 }

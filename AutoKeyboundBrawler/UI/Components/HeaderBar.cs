@@ -302,7 +302,7 @@ internal static class HeaderBar
         if (!popup) return;
 
         var selected = config.SelectedLanguage;
-        var gameLang = ECommons.DalamudServices.Svc.ClientState.ClientLanguage;
+        var gameLang = Loc.GameLanguage;
         var autoLabel = $"{Loc.Get("LangAuto")} [{Loc.GetLanguageShortName(gameLang)}]";
 
         if (ImGui.Selectable(autoLabel, !selected.HasValue))
@@ -313,27 +313,33 @@ internal static class HeaderBar
 
         ImGui.Separator();
 
-        if (ImGui.Selectable("English (EN)", selected == Dalamud.Game.ClientLanguage.English))
+        if (ImGui.Selectable("English (EN)", selected == UiLanguage.English))
         {
-            config.SelectedLanguage = Dalamud.Game.ClientLanguage.English;
+            config.SelectedLanguage = UiLanguage.English;
             config.Save();
         }
 
-        if (ImGui.Selectable("日本語 (JA)", selected == Dalamud.Game.ClientLanguage.Japanese))
+        if (ImGui.Selectable("日本語 (JA)", selected == UiLanguage.Japanese))
         {
-            config.SelectedLanguage = Dalamud.Game.ClientLanguage.Japanese;
+            config.SelectedLanguage = UiLanguage.Japanese;
             config.Save();
         }
 
-        if (ImGui.Selectable("Deutsch (DE)", selected == Dalamud.Game.ClientLanguage.German))
+        if (ImGui.Selectable("Deutsch (DE)", selected == UiLanguage.German))
         {
-            config.SelectedLanguage = Dalamud.Game.ClientLanguage.German;
+            config.SelectedLanguage = UiLanguage.German;
             config.Save();
         }
 
-        if (ImGui.Selectable("Français (FR)", selected == Dalamud.Game.ClientLanguage.French))
+        if (ImGui.Selectable("Français (FR)", selected == UiLanguage.French))
         {
-            config.SelectedLanguage = Dalamud.Game.ClientLanguage.French;
+            config.SelectedLanguage = UiLanguage.French;
+            config.Save();
+        }
+
+        if (ImGui.Selectable("한국어 (KO)", selected == UiLanguage.Korean))
+        {
+            config.SelectedLanguage = UiLanguage.Korean;
             config.Save();
         }
     }

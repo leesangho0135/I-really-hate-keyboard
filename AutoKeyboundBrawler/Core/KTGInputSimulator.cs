@@ -2,12 +2,24 @@ using FFXIVClientStructs.FFXIV.Client.System.Input;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace AutoKeyboundBrawler.Core;
 
 public unsafe class KTGInputSimulator
 {
+    private delegate void NativeKeySender(ref KeyboardDevice device, SeVirtualKey key);
+    private delegate void NativeCharacterSender(IntPtr window, uint message, IntPtr character, IntPtr extra);
+
+    // Older regional Dalamud builds do not expose these optional native methods.
+    private static readonly NativeKeySender? NativeSendKey = GetOptionalKeyboardMethod<NativeKeySender>(
+        "SendKey", BindingFlags.Public | BindingFlags.Instance, [typeof(SeVirtualKey)]);
+    private static readonly NativeCharacterSender? NativeSendCharacter = GetOptionalKeyboardMethod<NativeCharacterSender>(
+        "ProcessKeyboardInputMessage", BindingFlags.Public | BindingFlags.Static,
+        [typeof(IntPtr), typeof(uint), typeof(IntPtr), typeof(IntPtr)]);
+
     public readonly struct KeyAction
     {
         public readonly SeVirtualKey VirtualKey;
@@ -54,8 +66,23 @@ public unsafe class KTGInputSimulator
             ? Data.KTGWordDatabase.StripPunctuation(word)
             : word).Trim();
 
+        // Keep mixed Korean/Latin phrases independent of the current IME mode.
+        // A virtual A key can otherwise compose Hangul instead of the letter A.
+        var useKoreanInput = Data.KTGWordDatabase.CurrentLanguage == Lumina.Data.Language.Korean ||
+                            ContainsHangul(textToType);
+        if (useKoreanInput)
+        {
+            textToType = textToType.Normalize(NormalizationForm.FormC);
+        }
+
         foreach (var ch in textToType)
         {
+            if (useKoreanInput)
+            {
+                _pendingActions.Enqueue(new KeyAction(ch));
+                continue;
+            }
+
             if (TryEnqueueCircumflex(ch, _pendingActions))
             {
                 continue;
@@ -77,6 +104,23 @@ public unsafe class KTGInputSimulator
 
         _nextDelayMs = GetRandomCharDelay(config);
         _stepStopwatch.Restart();
+    }
+
+    private static bool ContainsHangul(string text)
+    {
+        foreach (var ch in text)
+        {
+            if (ch is >= '\uAC00' and <= '\uD7A3' or
+                      >= '\u1100' and <= '\u11FF' or
+                      >= '\u3130' and <= '\u318F' or
+                      >= '\uA960' and <= '\uA97F' or
+                      >= '\uD7B0' and <= '\uD7FF')
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     public void Clear()
@@ -106,15 +150,23 @@ public unsafe class KTGInputSimulator
             return;
         }
 
-        var action = _pendingActions.Dequeue();
-        if (action.IsUnicode)
+        // Windows input targets the foreground process. Keep the queue intact
+        // while the player is using another app on builds needing that fallback.
+        if ((NativeSendKey == null || NativeSendCharacter == null) && !IsCurrentProcessForeground())
         {
-            SendUnicodeChar(action.Character);
+            return;
         }
-        else
+
+        var action = _pendingActions.Peek();
+        var sent = action.IsUnicode
+            ? TrySendUnicodeChar(action.Character)
+            : TrySendKey(action.VirtualKey);
+        if (!sent)
         {
-            SendKey(action.VirtualKey);
+            _stepStopwatch.Restart();
+            return;
         }
+        _pendingActions.Dequeue();
 
         if (!action.IsUnicode && action.VirtualKey == SeVirtualKey.RETURN)
         {
@@ -194,29 +246,40 @@ public unsafe class KTGInputSimulator
 
     public static void SendKey(SeVirtualKey key)
     {
-        try
-        {
-            var manager = InputDeviceManager.Instance();
-            if (manager != null && manager->KeyboardDevice != null)
-            {
-                manager->KeyboardDevice->SendKey(key);
-                return;
-            }
-        }
-        catch
-        {
-            // Fallback to Win32 keybd_event if KeyboardDevice is inaccessible
-        }
-
-        SendWin32Key(key);
+        TrySendKey(key);
     }
 
-    private static void SendWin32Key(SeVirtualKey key)
+    private static bool TrySendKey(SeVirtualKey key)
     {
+        if (NativeSendKey != null)
+        {
+            try
+            {
+                var manager = InputDeviceManager.Instance();
+                if (manager != null && manager->KeyboardDevice != null)
+                {
+                    NativeSendKey(ref *manager->KeyboardDevice, key);
+                    return true;
+                }
+            }
+            catch
+            {
+                // Fallback to Win32 keybd_event if KeyboardDevice is inaccessible.
+            }
+        }
+
+        return SendWin32Key(key);
+    }
+
+    private static bool SendWin32Key(SeVirtualKey key)
+    {
+        if (!IsCurrentProcessForeground()) return false;
+
         const uint KEYEVENTF_KEYUP = 0x0002;
         var vk = (byte)key;
-        PInvoke.keybd_event(vk, 0, 0, 0);
-        PInvoke.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
+        PInvoke.keybd_event(vk, 0, 0, UIntPtr.Zero);
+        PInvoke.keybd_event(vk, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+        return true;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -231,6 +294,20 @@ public unsafe class KTGInputSimulator
     {
         [FieldOffset(0)]
         public KEYBDINPUT ki;
+        // INPUT's union must also reserve the larger mouse member (32 bytes on x64).
+        [FieldOffset(0)]
+        public MOUSEINPUT mi;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MOUSEINPUT
+    {
+        public int dx;
+        public int dy;
+        public uint mouseData;
+        public uint dwFlags;
+        public uint time;
+        public UIntPtr dwExtraInfo;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -249,15 +326,26 @@ public unsafe class KTGInputSimulator
 
     public static void SendUnicodeChar(char c)
     {
-        try
+        TrySendUnicodeChar(c);
+    }
+
+    private static bool TrySendUnicodeChar(char c)
+    {
+        if (NativeSendCharacter != null)
         {
-            const uint WM_CHAR = 0x0102;
-            KeyboardDevice.ProcessKeyboardInputMessage(IntPtr.Zero, WM_CHAR, (IntPtr)c, IntPtr.Zero);
-            return;
+            try
+            {
+                const uint WM_CHAR = 0x0102;
+                NativeSendCharacter(IntPtr.Zero, WM_CHAR, (IntPtr)c, IntPtr.Zero);
+                return true;
+            }
+            catch
+            {
+                // Use Windows Unicode input when the native method is unavailable.
+            }
         }
-        catch
-        {
-        }
+
+        if (!IsCurrentProcessForeground()) return false;
 
         var inputs = new INPUT[2];
         inputs[0] = new INPUT
@@ -291,7 +379,27 @@ public unsafe class KTGInputSimulator
             }
         };
 
-        PInvoke.SendInput((uint)inputs.Length, inputs, sizeof(INPUT));
+        return PInvoke.SendInput((uint)inputs.Length, inputs, sizeof(INPUT)) == inputs.Length;
+    }
+
+    private static T? GetOptionalKeyboardMethod<T>(string name, BindingFlags flags, Type[] parameters) where T : Delegate
+    {
+        try
+        {
+            return typeof(KeyboardDevice).GetMethod(name, flags, null, parameters, null)?.CreateDelegate<T>();
+        }
+        catch (ArgumentException)
+        {
+            return null;
+        }
+    }
+
+    private static bool IsCurrentProcessForeground()
+    {
+        var window = PInvoke.GetForegroundWindow();
+        if (window == IntPtr.Zero) return false;
+        PInvoke.GetWindowThreadProcessId(window, out var processId);
+        return processId == Environment.ProcessId;
     }
 
     private static bool TryEnqueueCircumflex(char ch, Queue<KeyAction> queue)
@@ -483,11 +591,17 @@ public unsafe class KTGInputSimulator
 
     private static class PInvoke
     {
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern short VkKeyScan(char ch);
 
         [DllImport("user32.dll")]
-        public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo);
+        public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
         [DllImport("user32.dll", SetLastError = true)]
         public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);

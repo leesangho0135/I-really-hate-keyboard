@@ -16,7 +16,8 @@ public static class KTGLocalizationRegistry
         "Keybound registrar",       // English
         "参加受付",                  // Japanese
         "Rezeptionistin",           // German
-        "préposée aux inscriptions" // French
+        "préposée aux inscriptions", // French
+        "참가 접수원"               // Korean (ENpcResident 1058751)
     ];
 
     public static bool IsRegistrar(uint dataId, string name)
@@ -68,7 +69,10 @@ public static class KTGLocalizationRegistry
         "Fluchblick",
         // French
         "Brouilleur sensoriel",
-        "Regard maudit"
+        "Regard maudit",
+        // Korean (Action 49702 and 49529)
+        "동작 감지 교란",
+        "저주의 시선"
     ];
 
     public static bool IsHaltSpell(string? spellName, uint actionId = 0)
@@ -105,7 +109,8 @@ public static class KTGLocalizationRegistry
         "Inputs disabled",
         "が付与された",
         "Schreibblockade verursacht",
-        "Impossible de saisir du texte"
+        "Impossible de saisir du texte",
+        "효과가 부여되었습니다" // Korean (Addon 17839)
     ];
 
     public static readonly string[] LocalizedInputsReEnabledBanners =
@@ -113,7 +118,8 @@ public static class KTGLocalizationRegistry
         "Inputs re-enabled",
         "が切れた",
         "Schreibblockade aufgehoben",
-        "s'est dissipé"
+        "s'est dissipé",
+        "효과가 사라졌습니다" // Korean (Addon 17840)
     ];
 
     public static bool MatchesInputsDisabled(string text)
@@ -146,7 +152,9 @@ public static class KTGLocalizationRegistry
         "針",           // Japanese Kanji (針？本, 針千本, 針幾千本)
         "はり",         // Japanese Hiragana
         "???",          // Signature of Cactuar ??? Needles across European localizations
-        "？"            // Fullwidth question mark in Japanese 針？本
+        "？",           // Fullwidth question mark in Japanese 針？本
+        "바늘",         // Korean (Action 49524)
+        "침천개"        // Korean (KTGTypeWordTextData 1453)
     ];
 
     public static readonly string[] LocalizedCactuarRoots =
@@ -156,7 +164,9 @@ public static class KTGLocalizationRegistry
         "さぼてんだー",  // Japanese Hiragana
         "kaktor",       // German
         "pampa",        // French
-        "sabotender"
+        "sabotender",
+        "사보텐",       // Korean (KTGTypeWordTextData 501, 841, 987, 1728)
+        "해피텐더"      // Korean (KTGTypeWordTextData 991)
     ];
 
     public static bool IsNeedlesSpell(string? spellName, uint actionId = 0)
@@ -190,7 +200,9 @@ public static class KTGLocalizationRegistry
         // French
         "défense", "bouclier", "barrière", "protéger",
         // Japanese
-        "防", "守", "バリア", "シールド"
+        "防", "守", "バリア", "シールド",
+        // Korean (KTGTypeWordTextData 522, 1426 and Addon 17841)
+        "방패", "방어", "보호막"
     ];
 
     public static bool ContainsDefenseKeyword(string word)
@@ -208,7 +220,8 @@ public static class KTGLocalizationRegistry
         "参加登録",      // Japanese
         "登録",          // Japanese
         "Anmelden",     // German
-        "S'inscrire"    // French
+        "S'inscrire",   // French
+        "참가 신청"     // Korean (Addon 17824)
     ];
 
     public static bool IsRegisterButtonText(string? text)

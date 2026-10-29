@@ -57,6 +57,7 @@ public class KTGAutomationManager
         var isActive = _config.MinigameAutoplay || _config.AutoLoopEnabled || _config.Enabled;
         if (!isActive)
         {
+            KTGAntiAfk.Reset();
             CurrentStatus = "Idle (Automation paused)";
             if (_simulator.IsTyping)
             {
@@ -65,15 +66,21 @@ public class KTGAutomationManager
             return;
         }
 
-        if (!KTGWordDatabase.IsLoaded || KTGWordDatabase.CurrentLanguage != Svc.ClientState.ClientLanguage)
+        if (KTGWordDatabase.NeedsReload(Svc.Data))
         {
             KTGWordDatabase.Load(Svc.Data, _log);
         }
 
         var phase = KTGStateReader.GetCurrentPhase();
 
-        // Keep-alive: Reset both game-internal ContentInputTimer and OS idle timer so FFXIV never auto-kicks for inactivity
-        KTGAntiAfk.KeepAlive();
+        if (!KTGAntiAfk.ShouldRun(_config, phase))
+        {
+            if (!KTGAntiAfk.Reset())
+            {
+                CurrentStatus = "Waiting for activity key release...";
+                return;
+            }
+        }
 
         switch (phase)
         {
@@ -158,6 +165,7 @@ public class KTGAutomationManager
     {
         if (!_config.MinigameAutoplay)
         {
+            KTGAntiAfk.Reset();
             CurrentStatus = "Minigame Autoplay Disabled";
             if (_simulator.IsTyping) _simulator.Clear();
             return;
@@ -166,6 +174,7 @@ public class KTGAutomationManager
         // 1. Evaluate Safety (Stop on Red Keyboard penalty cast / Stun)
         if (!KTGSafetyGuard.CanType(_config, out var safetyReason))
         {
+            KTGAntiAfk.Reset();
             CurrentStatus = $"SAFETY HALT: {safetyReason}";
             _wasInHalt = true;
             _haltRecoveryState = HaltRecoveryState.SendEnter;
@@ -184,6 +193,12 @@ public class KTGAutomationManager
         // We MUST press Enter first to activate the text window, and only then press Esc (if text exists) or proceed.
         if (_wasInHalt)
         {
+            if (!KTGAntiAfk.Reset())
+            {
+                CurrentStatus = "Waiting for activity key release...";
+                return;
+            }
+
             if (HandleHaltRecovery())
             {
                 return;
@@ -207,6 +222,16 @@ public class KTGAutomationManager
         if (submitAgeMs < 100)
         {
             CurrentStatus = "Waiting for screen update...";
+            return;
+        }
+
+        // Only pulse between words, after the Enter debounce. Holding Ctrl
+        // while typing would turn letters into shortcuts, so wait for key-up.
+        if (KTGAntiAfk.KeepAlive(
+                !_simulator.IsTyping && AddonKTGInput.IsInputEmpty(),
+                _config.DiagnosticLogging))
+        {
+            CurrentStatus = "Preventing inactivity kick...";
             return;
         }
 
@@ -564,6 +589,7 @@ public class KTGAutomationManager
 
     public void Reset()
     {
+        KTGAntiAfk.Reset();
         _simulator.Clear();
         _lastTargetSlotId = -1;
         _lastPreemptTime = DateTime.MinValue;

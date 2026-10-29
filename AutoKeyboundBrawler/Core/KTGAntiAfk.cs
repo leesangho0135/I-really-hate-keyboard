@@ -1,148 +1,158 @@
+using ECommons.DalamudServices;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 using System;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 namespace AutoKeyboundBrawler.Core;
 
 /// <summary>
-/// Multi-layered anti-AFK system that prevents the game from kicking the player
-/// for inactivity inside instanced content.
-///
-/// Layer 1 (Primary): Post WM_MOUSEMOVE to the game window — this is processed
-///     by the game's WndProc and resets all internal input timers through the
-///     game's own code path, which is the most reliable approach.
-/// Layer 2: Directly zero InputTimerModule timer fields (top-level + per-device).
-/// Layer 3: OS-level mouse_event(MOVE,0,0) to reset Windows GetLastInputInfo.
+/// Event-scoped inactivity protection. A short game-window key pulse complements
+/// the local timer resets; zero-motion mouse events alone do not establish that
+/// the client processed keyboard activity.
 /// </summary>
 public static unsafe class KTGAntiAfk
 {
-    private static DateTime _lastGameMsgTime = DateTime.MinValue;
-    private static DateTime _lastOsPulseTime = DateTime.MinValue;
+    private static readonly KTGActivityPulse ActivityPulse = new();
     private static DateTime _lastDiagLogTime = DateTime.MinValue;
-    private static IntPtr _cachedGameHwnd = IntPtr.Zero;
+    private static DateTime _lastWarningTime = DateTime.MinValue;
+    private static IntPtr _cachedGameHwnd;
 
-    public static void KeepAlive()
+    internal static bool ShouldRun(Configuration config, EventPhase phase)
     {
-        // ── Layer 1: Post WM_MOUSEMOVE to the game's own window ──────────
-        // This goes through the game's normal WndProc and resets all input
-        // timers exactly as real mouse movement would. We send it every 3
-        // seconds — far more often than any inactivity threshold.
-        if ((DateTime.UtcNow - _lastGameMsgTime).TotalSeconds >= 3.0)
+        return config.Enabled && config.MinigameAutoplay && phase == EventPhase.InMinigame;
+    }
+
+    // Returns true while Ctrl is held, so the caller leaves the typing queue
+    // untouched until the matching key-up has been accepted.
+    public static bool KeepAlive(bool canStartPulse, bool diagnosticLogging)
+    {
+        ResetGameTimers();
+
+        var wasHolding = ActivityPulse.IsHoldingKey;
+        var isHolding = ActivityPulse.Tick(
+            Environment.TickCount64,
+            canStartPulse && (GetAsyncKeyState(LeftControlKey) & 0x8000) == 0,
+            SendActivityMessage);
+
+        if (!wasHolding && isHolding && diagnosticLogging)
         {
-            _lastGameMsgTime = DateTime.UtcNow;
-            try
-            {
-                var hwnd = GetGameWindowHandle();
-                if (hwnd != IntPtr.Zero)
-                {
-                    // WM_MOUSEMOVE with position (1,1) — a harmless no-op that
-                    // the game processes as real input activity.
-                    PostMessage(hwnd, WM_MOUSEMOVE, IntPtr.Zero, MakeLParam(1, 1));
-                }
-            }
-            catch
-            {
-                // Ignore — Layer 2 and 3 will cover us
-            }
+            Svc.Log.Information("[AntiAfk] Started event activity key pulse; typing waits for key release.");
         }
 
-        // ── Layer 2: Direct InputTimerModule field zeroing ───────────────
+        return isHolding;
+    }
+
+    public static bool Reset()
+    {
+        if (!ActivityPulse.Reset(SendActivityMessage)) return false;
+        _cachedGameHwnd = IntPtr.Zero;
+        return true;
+    }
+
+    private static void ResetGameTimers()
+    {
         try
         {
             var timerModule = InputTimerModule.Instance();
-            if (timerModule != null)
+            if (timerModule == null)
             {
-                // Diagnostic: log timer values periodically to help debug kicks
-                if ((DateTime.UtcNow - _lastDiagLogTime).TotalSeconds >= 10.0)
-                {
-                    _lastDiagLogTime = DateTime.UtcNow;
-                    ECommons.DalamudServices.Svc.Log.Verbose(
-                        $"[AntiAfk] Timers before reset: Content={timerModule->ContentInputTimer:F2} " +
-                        $"Afk={timerModule->AfkTimer:F2} Input={timerModule->InputTimer:F2} " +
-                        $"Limit={timerModule->InstanceContentAfkTimeLimit:F0} " +
-                        $"Status={timerModule->Status}");
-                }
-
-                // Zero top-level timers
-                timerModule->ContentInputTimer = 0f;
-                timerModule->AfkTimer = 0f;
-                timerModule->InputTimer = 0f;
-
-                // Zero per-device timers (controller + mouse InputTimerData arrays)
-                ResetInputTimerDataSpan(timerModule->ControllerInputTimers);
-                ResetInputTimerDataSpan(timerModule->MouseInputTimers);
+                LogWarning("[AntiAfk] InputTimerModule is unavailable; using the activity key pulse.");
+                return;
             }
-            else
+
+            if ((DateTime.UtcNow - _lastDiagLogTime).TotalSeconds >= 10)
             {
-                LogDiag("[AntiAfk] InputTimerModule.Instance() returned null!");
+                _lastDiagLogTime = DateTime.UtcNow;
+                Svc.Log.Verbose(
+                    $"[AntiAfk] Timers before reset: Content={timerModule->ContentInputTimer:F2} " +
+                    $"Afk={timerModule->AfkTimer:F2} Input={timerModule->InputTimer:F2}");
             }
+
+            timerModule->ContentInputTimer = 0f;
+            timerModule->AfkTimer = 0f;
+            timerModule->InputTimer = 0f;
+            ResetInputTimerDataSpan(timerModule->ControllerInputTimers);
+            ResetInputTimerDataSpan(timerModule->MouseInputTimers);
         }
         catch (Exception ex)
         {
-            LogDiag($"[AntiAfk] InputTimerModule reset failed: {ex.Message}");
-        }
-
-        // ── Layer 3: OS-level idle timer reset ───────────────────────────
-        if ((DateTime.UtcNow - _lastOsPulseTime).TotalSeconds >= 5.0)
-        {
-            _lastOsPulseTime = DateTime.UtcNow;
-            try
-            {
-                mouse_event(MOUSEEVENTF_MOVE, 0, 0, 0, 0);
-            }
-            catch
-            {
-                // Ignore
-            }
+            LogWarning($"[AntiAfk] Input timer reset failed: {ex.Message}");
         }
     }
 
     private static void ResetInputTimerDataSpan(Span<InputTimerModule.InputTimerData> span)
     {
-        for (var i = 0; i < span.Length; i++)
+        for (var i = 0; i < span.Length; i++) span[i].Timer = 0f;
+    }
+
+    private static bool SendActivityMessage(bool keyDown)
+    {
+        var window = GetGameWindowHandle();
+        if (window == IntPtr.Zero)
         {
-            span[i].Timer = 0f;
+            LogWarning("[AntiAfk] Game window not found; activity pulse will retry.");
+            return false;
         }
+
+        // Target this game's message queue, including in the background.
+        // The OS cursor and other applications receive no input from this path.
+        var keyFlags = keyDown ? 0x001D0001u : 0xC01D0001u;
+        if (PostMessage(window, keyDown ? WmKeyDown : WmKeyUp,
+                (IntPtr)LeftControlKey, unchecked((IntPtr)(int)keyFlags)))
+        {
+            return true;
+        }
+
+        LogWarning($"[AntiAfk] Activity key message failed (Win32 {Marshal.GetLastWin32Error()}); will retry.");
+        return false;
     }
 
     private static IntPtr GetGameWindowHandle()
     {
-        if (_cachedGameHwnd != IntPtr.Zero)
-            return _cachedGameHwnd;
+        if (IsCurrentGameWindow(_cachedGameHwnd)) return _cachedGameHwnd;
 
-        try
+        _cachedGameHwnd = IntPtr.Zero;
+        var candidate = IntPtr.Zero;
+        while ((candidate = FindWindowEx(IntPtr.Zero, candidate, "FFXIVGAME", null)) != IntPtr.Zero)
         {
-            _cachedGameHwnd = Process.GetCurrentProcess().MainWindowHandle;
-        }
-        catch
-        {
-            // Ignore
+            if (!IsCurrentGameWindow(candidate)) continue;
+            _cachedGameHwnd = candidate;
+            break;
         }
 
         return _cachedGameHwnd;
     }
 
-    /// <summary>Log diagnostic message at most once per 30 seconds to avoid spam.</summary>
-    private static void LogDiag(string message)
+    private static bool IsCurrentGameWindow(IntPtr window)
     {
-        if ((DateTime.UtcNow - _lastDiagLogTime).TotalSeconds >= 30.0)
-        {
-            _lastDiagLogTime = DateTime.UtcNow;
-            ECommons.DalamudServices.Svc.Log.Warning(message);
-        }
+        if (window == IntPtr.Zero || !IsWindow(window)) return false;
+        GetWindowThreadProcessId(window, out var processId);
+        return processId == Environment.ProcessId;
     }
 
-    // ── Win32 Interop ────────────────────────────────────────────────────
+    private static void LogWarning(string message)
+    {
+        if ((DateTime.UtcNow - _lastWarningTime).TotalSeconds < 30) return;
+        _lastWarningTime = DateTime.UtcNow;
+        Svc.Log.Warning(message);
+    }
 
-    private const uint WM_MOUSEMOVE = 0x0200;
-    private const uint MOUSEEVENTF_MOVE = 0x0001;
+    private const int LeftControlKey = 0xA2;
+    private const uint WmKeyDown = 0x0100;
+    private const uint WmKeyUp = 0x0101;
 
-    private static IntPtr MakeLParam(int x, int y) => (IntPtr)((y << 16) | (x & 0xFFFF));
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string className, string? windowName);
 
     [DllImport("user32.dll")]
-    private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    private static extern bool IsWindow(IntPtr window);
 
     [DllImport("user32.dll")]
-    private static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, int dwExtraInfo);
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+    [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int key);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool PostMessage(IntPtr window, uint message, IntPtr key, IntPtr flags);
 }

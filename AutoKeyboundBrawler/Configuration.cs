@@ -22,7 +22,7 @@ public class Configuration : IPluginConfiguration
     public bool AutoOpenNearRegistrar { get; set; } = true;
 
     // UI Language override (null = Auto-detect from game client)
-    public Dalamud.Game.ClientLanguage? SelectedLanguage { get; set; } = null;
+    public UiLanguage? SelectedLanguage { get; set; } = null;
 
     // Granular AFK Loop Sub-Flags (synchronized with AutoLoopEnabled)
     public bool AutoTalkRegistrar { get; set; } = false;
